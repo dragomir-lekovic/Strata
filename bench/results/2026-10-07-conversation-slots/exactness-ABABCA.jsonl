@@ -1,0 +1,6 @@
+{"tag": "A", "conv": "A", "wall_s": 3.49, "cache_n": 0, "prompt_n": 7289, "prompt_ms": 2738.4, "decode_tok_s": 26.5, "text": "prairie"}
+{"tag": "B", "conv": "B", "wall_s": 3.29, "cache_n": 0, "prompt_n": 7274, "prompt_ms": 2576.6, "decode_tok_s": 40.9, "text": "topaz"}
+{"tag": "A", "conv": "A", "wall_s": 1.04, "cache_n": 7282, "prompt_n": 40, "prompt_ms": 296.0, "decode_tok_s": 44.0, "text": "prairie hotel"}
+{"tag": "B", "conv": "B", "wall_s": 1.04, "cache_n": 7267, "prompt_n": 40, "prompt_ms": 293.0, "decode_tok_s": 36.9, "text": "topaz cloud"}
+{"tag": "C", "conv": "C", "wall_s": 3.3, "cache_n": 0, "prompt_n": 7250, "prompt_ms": 2613.1, "decode_tok_s": 55.0, "text": "sierra"}
+{"tag": "A", "conv": "A", "wall_s": 1.05, "cache_n": 7327, "prompt_n": 29, "prompt_ms": 285.3, "decode_tok_s": 42.3, "text": "prairie hotel quartz"}

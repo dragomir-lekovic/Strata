@@ -24,7 +24,7 @@ bool fail(std::string& error, const char* message) {
 }
 
 bool sync(std::string& error) {
-    const auto status = cudaDeviceSynchronize();
+    const auto status = conversation_detail::io_sync();
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot synchronize: ") + cudaGetErrorString(status);
     return false;
@@ -33,7 +33,7 @@ bool sync(std::string& error) {
 bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
+    const auto status = conversation_detail::io_copy(dst, src, bytes);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;

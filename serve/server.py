@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import itertools
 import base64
 import hashlib
 import hmac
@@ -631,6 +632,8 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_hint = False            # it takes HINT/UNHINT about queued requests (READY <ctx> ... hint, 0.1.32+)
+        self.hint_tags = itertools.count(1)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -696,6 +699,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_hint = "hint" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -912,6 +916,37 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    def _write(self, line: str):
+        """One line to the engine's stdin.  Several threads write - a request's GEN/STOP, a queued request's
+        HINT/UNHINT, the batch's control lines (_send) - so under the same wlock."""
+        lock = self.__dict__.get("wlock")
+        if lock is None:                                # an engine object made without a started process (the tests)
+            lock = self.wlock = threading.Lock()
+        with lock:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+
+    def hint(self, ids, sampling: dict | None = None):
+        """Tell the engine about a request that is waiting for its turn, so it can ready the standby conversation
+        slot while the current request decodes (--conversation-vram-slots 2).  Returns a tag for unhint(), or None
+        when the engine does not take hints.  Advice only: a lost hint costs the prefetch, never a wrong answer."""
+        if not self.can_hint or not self.alive():
+            return None
+        tag = f"h{next(self.hint_tags)}"
+        try:
+            self._write(f"HINT {tag}{self.projection_key(sampling or {})} {','.join(str(int(t)) for t in ids)}\n")
+        except (OSError, ValueError):
+            return None
+        return tag
+
+    def unhint(self, tag):
+        if tag is None or not self.alive():
+            return
+        try:
+            self._write(f"UNHINT {tag}\n")
+        except (OSError, ValueError):
+            pass
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -934,8 +969,7 @@ class StrataEngine:
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
-        self.proc.stdin.flush()
+        self._write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
         deadline = time.time() + timeout
         while True:
             try:
@@ -1641,8 +1675,7 @@ class StrataEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
+            self._write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -1723,8 +1756,7 @@ class StrataEngine:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        self._write("STOP\n")
                     except OSError:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
@@ -1815,8 +1847,7 @@ class StrataEngine:
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
+            self._write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
@@ -1907,8 +1938,7 @@ class StrataEngine:
         try:
             if self.proc.poll() is None:
                 try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
+                    self._write("QUIT\n")
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
                     self.proc.wait(timeout=20)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -3086,6 +3116,17 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
+    def _hint(self, ids, sampling):
+        """A request about to wait for the FIFO tells the engine what it will ask (HINT), so its conversation is
+        streamed into the GPU's standby slot while the current one decodes and the switch costs a swap instead of a
+        RAM restore or a re-read of the whole prompt (--conversation-vram-slots).  -> the tag to withdraw with
+        engine.unhint() once its turn comes, or None (nothing is running, or the engine takes no hints)."""
+        locked = getattr(self.fifo, "locked", None)
+        if locked is None or not locked():              # nothing to wait behind: its GEN comes right away
+            return None
+        hint = getattr(self.engine, "hint", None)
+        return hint(ids, sampling) if hint is not None else None
+
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
@@ -3745,6 +3786,9 @@ class Service:
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
+                # a request that has to wait first tells the engine what it will ask (HINT), so its conversation is
+                # streamed into the GPU's standby slot while the current one decodes (--conversation-vram-slots 2)
+                tag = self._hint(ids, sampling)
                 try:
                     while not got:
                         got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
@@ -3758,6 +3802,9 @@ class Service:
                     with self.status_lock:
                         self.status["queued"] -= 1
                     raise
+                finally:
+                    if tag is not None:                  # its turn (the GEN line follows), or it left the queue
+                        self.engine.unhint(tag)
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1

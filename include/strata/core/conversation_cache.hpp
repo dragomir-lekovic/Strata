@@ -1,11 +1,14 @@
 // CPU-only ownership and matching policy for --serve's parked conversations.
 // Token equality, image identity, and steering mode are all required for reuse.
+// A parked conversation leaves after `ttl_s` seconds without use (--conversation-cache-ttl-s, 30 minutes by
+// default): the RAM tier holds every recent chat, the byte budget and slot cap only bound the worst case.
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -156,6 +159,7 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    uint64_t parked_s = 0; // conversation_clock_s() when it last left the GPU: the TTL counts from here
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -188,6 +192,55 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// Monotonic seconds for the TTL (steady: a wall-clock change neither expires nor revives anything).
+inline uint64_t conversation_clock_s() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/// A queued request's hint (HINT, --serve) carries token ids only - its pictures are encoded after it is
+/// admitted - so a prefetch decision matches ids alone.  The request itself still needs conversation_prefix.
+template<class Token>
+int64_t conversation_prefix_ids(const ConversationCheckpoint& c, const std::vector<Token>& prompt) {
+    const size_t n = c.ids.size();
+    if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
+    return (int64_t) n;
+}
+
+struct ConversationMatch {
+    int64_t tokens = 0;
+    bool live = false;
+};
+
+/// The longest prefix of `prompt` one conversation can resume: its live tokens or one of its checkpoints.
+/// Ties prefer the live state. The parked RAM entries and the standby VRAM slot share this rule.
+template<class Token>
+ConversationMatch conversation_best(const SavedConversation& e, const std::vector<Token>& prompt,
+                                    const std::vector<ConversationImageKey>& images, bool cvec) {
+    ConversationMatch best;
+    if (e.cvec != cvec) return best;
+    auto consider = [&](const ConversationCheckpoint& c, bool live) {
+        const int64_t n = conversation_prefix(c, prompt, images);
+        if (n > best.tokens) best = {n, live};
+    };
+    consider(e.live, true);
+    for (const auto& c : e.checkpoints) consider(c, false);
+    return best;
+}
+
+template<class Token>
+ConversationMatch conversation_best_ids(const SavedConversation& e, const std::vector<Token>& prompt, bool cvec) {
+    ConversationMatch best;
+    if (e.cvec != cvec) return best;
+    auto consider = [&](const ConversationCheckpoint& c, bool live) {
+        const int64_t n = conversation_prefix_ids(c, prompt);
+        if (n > best.tokens) best = {n, live};
+    };
+    consider(e.live, true);
+    for (const auto& c : e.checkpoints) consider(c, false);
+    return best;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -196,8 +249,8 @@ public:
         bool live = false;
     };
 
-    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
-        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0, uint64_t ttl_s = 0)
+        : budget_(budget), slots_(slots), min_tokens_(min_tokens), ttl_s_(ttl_s) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -213,6 +266,38 @@ public:
         for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
         return n;
     }
+    size_t expired() const { return expired_; }
+    uint64_t ttl_s() const { return ttl_s_; }
+    size_t budget() const { return budget_; }
+
+    /// Drop every entry parked `ttl_s` or more seconds before `now_s` (0 = no expiry). Returns how many left.
+    /// An entry holding a pinned shared prefix stays, as it does under make_room's eviction.
+    size_t expire(uint64_t now_s) {
+        if (ttl_s_ == 0) return 0;
+        size_t n = 0;
+        for (size_t i = 0; i < entries_.size();) {
+            const auto& e = entries_[i];
+            if (!e.pinned() && now_s >= e.parked_s && now_s - e.parked_s >= ttl_s_) {
+                bytes_ -= e.bytes();
+                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                ++n;
+            } else {
+                ++i;
+            }
+        }
+        expired_ += n;
+        return n;
+    }
+    /// Seconds until the oldest unpinned entry expires (UINT64_MAX: nothing to expire) - the idle wake-up of the
+    /// slot worker.
+    uint64_t next_expiry_s(uint64_t now_s) const {
+        if (ttl_s_ == 0) return UINT64_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (const auto& e : entries_) if (!e.pinned()) oldest = std::min(oldest, e.parked_s);
+        if (oldest == UINT64_MAX) return UINT64_MAX;
+        const uint64_t age = now_s >= oldest ? now_s - oldest : 0;
+        return age >= ttl_s_ ? 0 : ttl_s_ - age;
+    }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
@@ -223,6 +308,12 @@ public:
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
+    }
+    // A standby slot's retained K/V moving to the active session, with the dirty boundary it already has.
+    void retain(ConversationKvReuse&& candidate) {
+        reuse_ = {};
+        if (enabled() && !candidate.kv.empty() && candidate.unchanged_tokens > 0 &&
+            candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
@@ -242,14 +333,18 @@ public:
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
-                const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live};
-            };
-            consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
+            const ConversationMatch m = conversation_best(entries_[i], prompt, images, cvec);
+            if (m.tokens > best.tokens) best = {i, m.tokens, m.live};
+        }
+        return best;
+    }
+
+    template<class Token>
+    Match best_ids(const std::vector<Token>& prompt, bool cvec) const {
+        Match best;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const ConversationMatch m = conversation_best_ids(entries_[i], prompt, cvec);
+            if (m.tokens > best.tokens) best = {i, m.tokens, m.live};
         }
         return best;
     }
@@ -347,8 +442,9 @@ public:
     }
 
 private:
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
+    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, expired_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    uint64_t ttl_s_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
 };

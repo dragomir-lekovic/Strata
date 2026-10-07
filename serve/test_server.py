@@ -5346,5 +5346,92 @@ class UntimedReads(unittest.TestCase):
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
 
+class QueueHints(unittest.TestCase):
+    """--conversation-vram-slots: a request that has to wait tells the engine what it will ask (HINT) while the
+    current one runs, and withdraws it (UNHINT) when its turn comes, before its GEN.  A request that does not wait
+    sends nothing - the hint is only worth its line while there is a decode to hide the prefetch behind."""
+
+    def test_waiting_request_hints_then_unhints(self):
+        tok = ByteTokenizer()
+        events, first_running, release = [], threading.Event(), threading.Event()
+
+        class Engine(MockEngine):
+            def hint(self, ids, sampling=None):
+                events.append(("hint", list(ids)))
+                return "t1"
+
+            def unhint(self, tag):
+                events.append(("unhint", tag))
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                events.append(("gen", list(ids)))
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if i == 0 and not first_running.is_set():
+                        first_running.set()
+                        release.wait(5)             # hold the fifo until the second request has queued
+                    yield t
+
+        svc = Service(Engine(tok, "</think>\n\n" + "y" * 10, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        a, b = tok.encode("first chat"), tok.encode("second chat")
+        out = {}
+
+        def run(name, ids):
+            out[name] = list(svc.run(ids, True, None, 8, {}, threading.Event()))
+
+        t1 = threading.Thread(target=run, args=("a", a))
+        t1.start()
+        self.assertTrue(first_running.wait(5))
+        t2 = threading.Thread(target=run, args=("b", b))
+        t2.start()
+        deadline = time.time() + 5
+        while not any(e[0] == "hint" for e in events) and time.time() < deadline:
+            time.sleep(0.005)
+        release.set()
+        t1.join(10)
+        t2.join(10)
+        self.assertEqual(events, [("gen", a), ("hint", b), ("unhint", "t1"), ("gen", b)])
+        self.assertEqual(out["b"][-1][0], "done")
+
+    def test_no_hint_without_a_queue(self):
+        tok = ByteTokenizer()
+        calls = []
+
+        class Engine(MockEngine):
+            def hint(self, ids, sampling=None):
+                calls.append(ids)
+                return "t"
+
+            def unhint(self, tag):
+                calls.append(tag)
+
+        svc = Service(Engine(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        list(svc.run(tok.encode("hi"), True, None, 8, {}, threading.Event()))
+        self.assertEqual(calls, [])
+
+    def test_hint_wire_format(self):
+        import io
+
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.can_hint, eng.ended = True, False
+        eng.wlock = threading.Lock()
+        eng.hint_tags = iter(range(7, 9))
+
+        class Proc:
+            stdin = io.StringIO()
+
+            @staticmethod
+            def poll():
+                return None
+
+        eng.proc = Proc()
+        tag = eng.hint([5, 6, 7], {"experimental_speed_projection": False})
+        eng.unhint(tag)
+        self.assertEqual(Proc.stdin.getvalue(), "HINT h7 cvec=0 5,6,7\nUNHINT h7\n")
+        eng.can_hint = False                            # an engine before 0.1.32 never sees the line
+        self.assertIsNone(eng.hint([1, 2]))
+
+
 if __name__ == "__main__":
     unittest.main()

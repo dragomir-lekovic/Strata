@@ -5,9 +5,53 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <array>
 #include <string>
 
 namespace strata::core {
+
+/// HOW the snapshot functions below move bytes on the calling thread.  Without a scope: synchronous `cudaMemcpy`
+/// and `cudaDeviceSynchronize`, which is what the serving thread has always used between requests.  The standby
+/// slot's worker (conversation_slot.hpp) fills and drains its mirror WHILE another request decodes, so inside a
+/// `ConversationIoScope`:
+///   * device transfers are `cudaMemcpyAsync` on `stream` + `cudaStreamSynchronize(stream)`, and the device-wide
+///     synchronisation is a stream one - the decode's non-blocking streams never wait on the worker;
+///   * a state buffer inside [host_lo, host_hi) is pinned memory the CPU addresses at its device address (UVA):
+///     a plain `memcpy`, no CUDA call at all (the 1.55 GiB of a streamed 128K K/V is a host-to-host copy);
+///   * `residency = false`: the target has no VRAM window and no draft ring (the mirror holds the authoritative
+///     K/V only), so validation does not require them and a restore does not refresh them.
+struct ConversationIo {
+    void* stream = nullptr;
+    const void* host_lo = nullptr;
+    const void* host_hi = nullptr;
+    bool residency = true;
+};
+class ConversationIoScope {
+public:
+    explicit ConversationIoScope(const ConversationIo& io);
+    ~ConversationIoScope();
+    ConversationIoScope(const ConversationIoScope&) = delete;
+    ConversationIoScope& operator=(const ConversationIoScope&) = delete;
+private:
+    const ConversationIo* previous_;
+    ConversationIo io_;
+};
+
+/// One contiguous run of conversation state: `host` when it lives in a streamed layer's pinned host copy.
+struct ConversationRange {
+    void* data = nullptr;
+    size_t bytes = 0;
+    bool host = false;
+};
+/// The bytes one QSA state holds for a conversation of `upto` cells, in the snapshot's order (K, V, K scales,
+/// V scales, completed indexer rows plus the spare one) - exactly what a snapshot captures, as pointer ranges.
+/// The identity layout makes every one of them a PREFIX of its array, so `upto = max_cells` is the capacity.
+bool conversation_kv_ranges(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                            std::array<ConversationRange, 5>& ranges, std::string& error);
+/// Bring a state's VRAM residency in line with an authoritative K/V that changed underneath it (a restore, a
+/// slot swap): a streamed layer forgets every resident page, a ring is refilled for a sequence at `upto`.
+bool conversation_kv_refresh(const QsaState& state, const ModelGeometry& g, int64_t upto, void* stream,
+                             std::string& error);
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).

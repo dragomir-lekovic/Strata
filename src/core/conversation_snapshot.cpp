@@ -11,6 +11,41 @@
 
 namespace strata::core {
 namespace {
+thread_local const ConversationIo* t_io = nullptr;
+
+bool in_host(const ConversationIo& io, const void* p) {
+    return io.host_lo != nullptr && p >= io.host_lo && p < io.host_hi;
+}
+} // namespace
+
+ConversationIoScope::ConversationIoScope(const ConversationIo& io) : previous_(t_io), io_(io) { t_io = &io_; }
+ConversationIoScope::~ConversationIoScope() { t_io = previous_; }
+
+namespace conversation_detail {
+const ConversationIo* io() { return t_io; }
+
+cudaError_t io_copy(void* dst, const void* src, size_t n) {
+    const ConversationIo* io = t_io;
+    // Default handles both device allocations and device-mapped host pool aliases (conversation_copy.hpp).
+    if (io == nullptr) return copy_nonblocking(dst, src, n);
+    // One side is always snapshot storage (pageable RAM): a pinned UVA target is plain host memory.
+    if (in_host(*io, dst) || in_host(*io, src)) {
+        std::memcpy(dst, src, n);
+        return cudaSuccess;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, (cudaStream_t) io->stream);
+    return e != cudaSuccess ? e : cudaStreamSynchronize((cudaStream_t) io->stream);
+}
+
+cudaError_t io_sync() {
+    const ConversationIo* io = t_io;
+    return io == nullptr ? cudaDeviceSynchronize() : cudaStreamSynchronize((cudaStream_t) io->stream);
+}
+} // namespace conversation_detail
+
+namespace {
+bool residency() { return t_io == nullptr || t_io->residency; }
+
 struct Layout {
     int format;
     int64_t cells, pooled_rows, page_size;
@@ -93,6 +128,7 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
     }
+    if (!residency()) return true;   // a slot mirror: the authoritative K/V only, no window or ring to keep
     if (st.kv_mode == 1) {
         const auto& m = st.map;
         if (m.n_blocks != st.n_pages || m.n_slots != st.n_slots || !m.page_table || !m.slot_block ||
@@ -113,13 +149,43 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
-    // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    const cudaError_t e = conversation_detail::io_copy(dst, src, n);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
 } // namespace
+
+bool conversation_kv_ranges(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                            std::array<ConversationRange, 5>& out, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    const auto p = pools(st);
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = {sizes[i] ? p[i] : nullptr, sizes[i], i < 4 && st.kv_mode != 0};
+        if (sizes[i] && !p[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+    }
+    return true;
+}
+
+bool conversation_kv_refresh(const QsaState& st, const ModelGeometry& g, int64_t upto, void* stream,
+                             std::string& error) {
+    // VRAM slots still contain the outgoing conversation. Resolve must refill
+    // them from the restored authoritative pools before any attention reads.
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, stream);
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+    return false;
+}
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                    int64_t upto, bool index, size_t& bytes, std::string& error) {
@@ -210,20 +276,8 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
-    // VRAM slots still contain the outgoing conversation. Resolve must refill
-    // them from the restored authoritative pools before any attention reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
-    if (st.kv_mode == 2 && upto > 0) {
-        auto shapes = strata::kernels::qsa_real_shapes();
-        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
-        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
-        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
-    }
-    const auto status = cudaGetLastError();
-    if (status == cudaSuccess) return true;
-    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
-    return false;
+    if (!residency()) return true;
+    return conversation_kv_refresh(st, g, upto, nullptr, error);
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

@@ -1,0 +1,4 @@
+{"tag": "A", "conv": "A", "wall_s": 40.42, "cache_n": 0, "prompt_n": 120269, "prompt_ms": 40129.3, "decode_tok_s": 38.0, "text": "jasper"}
+{"tag": "B", "conv": "B", "wall_s": 40.33, "cache_n": 0, "prompt_n": 120601, "prompt_ms": 40030.6, "decode_tok_s": 31.8, "text": "topaz"}
+{"tag": "A", "conv": "A", "wall_s": 40.18, "cache_n": 0, "prompt_n": 120302, "prompt_ms": 39845.8, "decode_tok_s": 38.5, "text": "jasper prairie"}
+{"tag": "B", "conv": "B", "wall_s": 40.21, "cache_n": 0, "prompt_n": 120634, "prompt_ms": 39908.1, "decode_tok_s": 43.8, "text": "topaz cloud"}

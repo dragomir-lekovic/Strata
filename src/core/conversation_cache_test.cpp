@@ -384,5 +384,69 @@ int main() {
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
     }
+    {   // the TTL: a parked conversation leaves `ttl` seconds after it was last parked, not after it was first seen
+        ConversationCache cache(1 << 20, 64, 0, 1800);
+        auto first = image({1, 2, 3}); first.parked_s = 100;
+        auto second = image({9, 8, 7}); second.parked_s = 1000;
+        const size_t second_bytes = second.bytes();
+        check(cache.put(std::move(first)) && cache.put(std::move(second)), "park two with different ages");
+        check(cache.next_expiry_s(1000) == 900, "the oldest expires first");
+        check(cache.expire(1899) == 0 && cache.size() == 2, "nothing leaves a second early");
+        check(cache.expire(1900) == 1 && cache.size() == 1 && cache.expired() == 1, "the oldest leaves at its TTL");
+        check(cache.best(a, {}, true).tokens == 0 && cache.best(b, {}, true).tokens == 3, "the younger one remains");
+        check(cache.bytes() == second_bytes, "expiry releases the byte accounting");
+        auto again = cache.take(cache.best(b, {}, true).index);
+        again.parked_s = 2700;                                    // used again, parked again: the clock restarts
+        cache.put(std::move(again));
+        check(cache.expire(2800) == 0 && cache.size() == 1, "re-parking restarts the TTL");
+        check(cache.expire(4500) == 1 && cache.size() == 0 && cache.next_expiry_s(4500) == UINT64_MAX, "then it goes");
+        ConversationCache forever(1 << 20, 4, 0, 0);
+        forever.put(image({1, 2, 3}));
+        check(forever.expire(UINT64_MAX) == 0 && forever.size() == 1, "TTL 0 keeps entries until evicted");
+        ConversationCache pins(1 << 20, 4, 0, 1800);
+        auto pinned = image({1, 2, 3}); pinned.parked_s = 100;
+        pinned.checkpoints.push_back(ConversationCheckpoint{});
+        pinned.checkpoints.back().ids = {1, 2};
+        pinned.checkpoints.back().pinned = true;
+        pins.put(std::move(pinned));
+        check(pins.next_expiry_s(100) == UINT64_MAX && pins.expire(UINT64_MAX) == 0 && pins.size() == 1,
+              "a pinned shared prefix outlives the TTL, as it outlives eviction");
+        check(conversation_clock_s() > 0, "the TTL clock runs");
+    }
+    {   // a queued request's hint has ids only: pictures do not exclude a conversation from the prefetch
+        auto s = image({1, 2, 3});
+        s.live.imgs = {{1, 123}};
+        ConversationCheckpoint cp; cp.ids = {1, 2}; cp.imgs = {{1, 123}};
+        s.checkpoints.push_back(cp);
+        ConversationCache cache(1 << 20, 4, 0, 1800);
+        cache.put(std::move(s));
+        check(cache.best(a, {}, true).tokens == 0, "the request itself still needs its pictures");
+        const auto m = cache.best_ids(a, true);
+        check(m.tokens == 3 && m.live, "the hint matches the live ids");
+        check(cache.best_ids(std::vector<int64_t>{1, 2, 9, 9}, true).tokens == 2, "and the checkpoints");
+        check(cache.best_ids(a, false).tokens == 0, "steering mode still separates");
+        SavedConversation one = image({1, 2, 3}, false);
+        check(conversation_best_ids(one, a, false).tokens == 3 && conversation_best_ids(one, a, true).tokens == 0,
+              "the standby slot's ids-only match");
+        check(conversation_best(one, a, {}, false).live, "the standby slot's full match prefers live");
+    }
+    {   // the standby slot's retained K/V moving to the active session keeps its dirty boundary
+        ConversationKv layer;
+        layer.k.resize(400);
+        ConversationKvReuse reuse;
+        reuse.kv.push_back(std::move(layer));
+        reuse.captured_tokens = 20; reuse.unchanged_tokens = 12;
+        const size_t need = reuse.bytes();
+        ConversationCache cache(need, 4);
+        cache.retain(std::move(reuse));
+        check(cache.retained_bytes() == need, "retained when it fits");
+        check(cache.take_reuse().unchanged_tokens == 12, "the boundary survives the move");
+        ConversationKvReuse big;
+        big.kv.resize(1);
+        big.kv[0].k.resize(need * 2);
+        big.captured_tokens = big.unchanged_tokens = 5;
+        cache.retain(std::move(big));
+        check(cache.retained_bytes() == 0, "dropped when over the budget");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

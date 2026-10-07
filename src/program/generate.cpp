@@ -25,6 +25,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/conversation_slot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -626,6 +627,8 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    int64_t conversation_cache_ttl_s = 1800;   // a parked conversation leaves after 30 minutes without use
+    int conversation_vram_slots = 1;           // 2: a standby VRAM slot beside the session (conversation_slot.hpp)
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -774,6 +777,10 @@ void usage() {
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                 "  --conversation-cache-ttl-s N  --serve: drop a parked conversation after N s without use\n"
+                 "                       (default 1800; 0 = keep until the budget or the slot cap evicts it)\n"
+                 "  --conversation-vram-slots N  --serve: conversations held on the GPU (default 1; 2 = a standby\n"
+                 "                       slot that the next queued conversation streams into while one decodes)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -2011,12 +2018,14 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--session-min-free-mib" || a == "--memory-limit-mib") {
+                 a == "--session-min-free-mib" || a == "--memory-limit-mib" || a == "--conversation-cache-ttl-s" ||
+                 a == "--conversation-vram-slots") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens")
-                                      ? INT32_MAX : INT64_MAX / (1024 * 1024);
+                                      ? INT32_MAX
+                                  : a == "--conversation-vram-slots" ? 2 : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
                 return 2;
@@ -2026,6 +2035,8 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
+            else if (a == "--conversation-cache-ttl-s") o.conversation_cache_ttl_s = number;
+            else if (a == "--conversation-vram-slots") o.conversation_vram_slots = (int) std::max<int64_t>(1, number);
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
@@ -2247,6 +2258,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
     // parking with --layer-split saves every stage (SavedConversation::stage_images)
+    if (o.conversation_vram_slots > 1 && (!o.serve || o.prompt_cache == 0 || !o.layer_split.empty() || o.batch > 0)) {
+        // the standby slot holds what a request leaves behind - nothing without --serve and the prompt cache - and
+        // mirrors ONE session: a layer split's per-stage sessions and the batch slots' own sessions are out
+        std::fprintf(stderr, "strata: --conversation-vram-slots 2 needs --serve, the prompt cache, one GPU and no "
+                             "--batch; running with one slot\n");
+        o.conversation_vram_slots = 1;
+    }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
@@ -4505,6 +4523,30 @@ int main(int argc, char** argv) {
         (void) cudaGetLastError();
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
         return 1;
+    }
+    // THE STANDBY VRAM SLOT (--conversation-vram-slots 2, conversation_slot.hpp): a second conversation's state
+    // beside the session's - GDN rows, PLE history, indexers (~320 MB of VRAM at 128K) and, for streamed layers,
+    // their authoritative K/V in pinned RAM (1.68 GiB at 128K int8).  Allocated here, BEFORE the expert cache
+    // sizes itself from what is free, so the cache gives up exactly the slot's VRAM and nothing is overcommitted.
+    strata::core::ConversationSlot conv_slot;
+    if (o.conversation_vram_slots > 1 && strata::core::qsa_kv_elastic()) {
+        // the elastic K/V maps the session's cells only as far as the context has grown: a swap would write past it
+        std::fprintf(stderr, "strata generate: --conversation-vram-slots 2 does not run with --kv-grow; running with "
+                             "one conversation slot\n");
+        o.conversation_vram_slots = 1;
+    }
+    if (o.conversation_vram_slots > 1 && !multi_gpu) {
+        const strata::core::OnDevice on0(0);
+        std::string se;
+        if (!strata::core::conversation_slot_init(conv_slot, ss, o.mtp.empty() ? nullptr : &mtp.kv_state(), g, se)) {
+            std::fprintf(stderr, "strata generate: %s - running with one conversation slot\n", se.c_str());
+            o.conversation_vram_slots = 1;
+        } else {
+            std::fprintf(stderr, "strata generate: conversation slots: 2 (the standby slot: %.0f MiB of VRAM, %.2f GiB "
+                                 "of pinned RAM%s)\n", (double) conv_slot.device_bytes / 1048576.0,
+                         (double) conv_slot.host_bytes / 1073741824.0,
+                         conv_slot.host_bytes && !conv_slot.uva ? ", moved by the GPU: no UVA" : "");
+        }
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -7733,7 +7775,29 @@ int main(int argc, char** argv) {
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens,
+            (uint64_t) o.conversation_cache_ttl_s);
+        // ---- THE STANDBY VRAM SLOT (conv_slot, conversation_slot.hpp).  `meta` is what the slot holds: ids,
+        // pictures, checkpoints and steering mode - never state bytes, those are in the slot.  `reuse` is the RAM K/V
+        // it was loaded from, retained so that writing it back appends what is new instead of copying it all again.
+        struct Standby {
+            bool occupied = false;
+            strata::core::SavedConversation meta;
+            strata::core::ConversationKvReuse reuse;
+        } standby;
+        // `slot_mu` orders the slot worker against the request path: `conversations`, `standby`, the slot's bytes and
+        // `anchor` change only under it.  A request takes it until its source is settled; the worker holds it for a
+        // whole load or write-back, so a request that arrives meanwhile waits for the transfer it would otherwise
+        // have to make itself.  (Hints have their own lock: the stdin thread must never wait for a transfer.)
+        std::mutex slot_mu;
+        // CPU threads for the pinned part of a slot move (0: half the hardware threads, at most 16)
+        const int slot_threads = std::getenv("STRATA_SLOT_THREADS") ? std::atoi(std::getenv("STRATA_SLOT_THREADS")) : 0;
+        std::vector<int64_t> anchor;   // the running prompt up to its last turn: what that chat's next turn repeats
+        cudaStream_t slot_stream = nullptr;
+        if (conv_slot.ready() && cudaStreamCreateWithFlags(&slot_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "strata serve: cannot create the conversation slot's stream\n");
+            return 1;
+        }
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -7810,39 +7874,44 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+        // One conversation's state into RAM: the session's (`split`: with its layer split's stages), or the standby
+        // slot's inside its IO scope.  `p_checks` is moved apart and back for a split.  `held`: bytes alive outside the
+        // cache meanwhile.  False only when the capture itself failed.
+        auto park_state = [&](const std::vector<int32_t>& p_ids, const std::vector<ImgKey>& p_imgs,
+                              std::vector<ConvCheckpoint>& p_checks, bool p_cvec, const strata::core::SessionState& from,
+                              const strata::core::QsaState* p_draft, strata::core::ConversationKvReuse reuse, bool split,
+                              size_t held, const char* what, std::string& pe) -> bool {
+            if (!conversations.enabled() || p_ids.empty()) return true;
             // --conversation-cache-min-tokens: a short conversation is not worth one of the slots.  Parking is a
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
             // cache is full, evict the long conversation they were interleaved with (oldest first) - the reuse it
             // wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths below take.
-            if (!conversations.wants((int64_t) live.size())) {
+            if (!conversations.wants((int64_t) p_ids.size())) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
                                      "minimum; parked=%zu)\n",
-                             live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                             p_ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(p_ids, p_imgs, p_checks, p_cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
-            const size_t n_st = stages.size();
+            const size_t n_st = split ? stages.size() : 0;
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
+            const strata::core::QsaState* draft0 = n_st > 0 ? nullptr : p_draft;   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
             strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(p_checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
-            } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            } merge_back{cs, p_checks, n_st > 0};
+            const strata::core::ConversationView view{p_ids, p_imgs, n_st > 0 ? cs.stage0 : p_checks, p_cvec};
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -7851,39 +7920,39 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                const strata::core::ConversationView view_k{p_ids, p_imgs, cs.parts[k], p_cvec};
                 size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
+                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, pe)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
-                                 st->dev, err.c_str());
-                    err.clear();
+                                 st->dev, pe.c_str());
+                    pe.clear();
                     return true;
                 }
                 if (!stage_reuse[k].kv.empty()) {
                     size_t r = 0;
                     if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
-                                                                          r, err)) {
+                                                                          r, pe)) {
                         b = r;
                         stage_retained += stage_reuse[k].bytes();
                     } else {
                         stage_reuse[k] = {};
-                        err.clear();
+                        pe.clear();
                     }
                 }
                 stage_estimate += b;
             }
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
-                err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
+            if (!strata::core::conversation_snapshot_bytes(view, from, g, draft0, estimate, pe)) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", pe.c_str());
+                pe.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, draft0, estimate, err)) {
+                    reuse, view, from, g, draft0, estimate, pe)) {
                 reuse = {};
                 estimate = fresh_estimate;
-                err.clear();
+                pe.clear();
             }
             estimate += stage_estimate;
             // A park carrying its own retained K/V replaces memory the cache
@@ -7934,15 +8003,15 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                if (!strata::core::conversation_snapshot_save(image, view, from, g, draft0, pe,
                         std::move(reuse), &reused_bytes)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                    if (cudaDeviceSynchronize() != cudaSuccess) { pe = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), pe,
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
@@ -7955,9 +8024,10 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                image.parked_s = strata::core::conversation_clock_s();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
+                             stored ? what : "skipped", view.ids.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
@@ -7966,6 +8036,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
             return true;
+        };
+        auto park_current_body = [&](size_t held) -> bool {
+            if (!live_ok || live.empty()) return true;
+            // the standby slot's retained K/V is RAM outside the cache, like an incoming image
+            return park_state(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr,
+                              conversations.take_reuse(), true, held + standby.reuse.bytes(), "parked", err);
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
@@ -7976,6 +8052,155 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
+        // The standby slot's conversation into RAM - or nowhere, when the cache is off or refuses it.  The slot is
+        // empty after.  False only when reading the slot failed (the session itself is never touched).
+        auto standby_writeback = [&](std::string& pe) -> bool {
+            if (!standby.occupied) return true;
+            strata::core::SavedConversation& m = standby.meta;
+            const strata::core::ConversationIo io = conv_slot.io(slot_stream);
+            bool ok = true;
+            try {
+                strata::core::ConversationIoScope scope(io);
+                ok = park_state(m.live.ids, m.live.imgs, m.checkpoints, m.cvec, conv_slot.ss,
+                                use_mtp ? &conv_slot.draft : nullptr, std::move(standby.reuse), false, 0,
+                                "wrote back the standby slot:", pe);
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; standby slot dropped\n");
+            }
+            if (!ok) std::fprintf(stderr, "strata serve: conversation slot: write-back failed (%s); dropped\n", pe.c_str());
+            pe.clear();
+            standby = {};
+            return ok;
+        };
+        // A parked conversation into the EMPTY standby slot, out of the cache.  False when the image does not fit
+        // this slot or the transfer failed: it is dropped and the slot stays empty (the session is not touched).
+        auto standby_load = [&](size_t index, std::string& pe) -> bool {
+            strata::core::SavedConversation image = conversations.take(index);
+            const auto t0 = Clock::now();
+            strata::core::ConversationRestore r;
+            {
+                const strata::core::ConversationIo io = conv_slot.io(slot_stream);
+                strata::core::ConversationIoScope scope(io);
+                r = strata::core::conversation_snapshot_restore(image, conv_slot.ss, g,
+                                                                 use_mtp ? &conv_slot.draft : nullptr, pe);
+            }
+            if (r != strata::core::ConversationRestore::restored) {
+                std::fprintf(stderr, "strata serve: conversation slot: discard parked conversation (%s)\n", pe.c_str());
+                pe.clear();
+                return false;
+            }
+            const int64_t n_ids = (int64_t) image.live.ids.size();
+            standby.occupied = true;
+            standby.meta = {};
+            standby.meta.live.ids = std::move(image.live.ids);
+            standby.meta.live.imgs = std::move(image.live.imgs);
+            standby.meta.checkpoints = std::move(image.checkpoints);
+            standby.meta.cvec = image.cvec;
+            strata::core::ConversationKvReuse reuse{std::move(image.kv), n_ids, n_ids, {}};
+            if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr &&
+                conversations.bytes() + reuse.bytes() <= conversations.budget()) standby.reuse = std::move(reuse);
+            std::fprintf(stderr, "strata serve: conversation slot: loaded %lld tokens into the standby slot in %.1f ms; "
+                                 "parked=%zu bytes=%zu\n", (long long) n_ids,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                         conversations.size(), conversations.bytes());
+            return true;
+        };
+        // ---- HINTS: `HINT <tag> [cvec=0|1] <ids>` names a request the server holds in its queue, `UNHINT <tag>`
+        // withdraws it once it has its turn.  The slot worker readies the standby slot for the oldest one while
+        // the current request decodes - load it from RAM, or empty the slot for a new chat - so the switch at its
+        // GEN is a swap or a copy, not a RAM round trip in front of the user.
+        struct Hint {
+            std::string tag;
+            std::vector<int64_t> ids;
+            bool cvec = true;
+            bool seen = false;
+        };
+        std::mutex hint_mu;
+        std::condition_variable hint_cv;
+        std::deque<Hint> hints;
+        bool slot_quit = false;
+        auto on_hint = [&](const std::string& l) {
+            const bool add = l.rfind("HINT ", 0) == 0;
+            std::istringstream in(l.substr(add ? 5 : 7));
+            Hint h;
+            in >> h.tag;
+            if (h.tag.empty()) return;
+            if (!add) {
+                std::lock_guard<std::mutex> lk(hint_mu);
+                hints.erase(std::remove_if(hints.begin(), hints.end(), [&](const Hint& x) { return x.tag == h.tag; }),
+                            hints.end());
+                return;
+            }
+            std::string tok, pe;
+            while (in >> tok && tok.find('=') != std::string::npos)
+                if (tok.rfind("cvec=", 0) == 0) h.cvec = std::atoi(tok.c_str() + 5) != 0;
+            if (!parse_i64_list(tok.c_str(), h.ids, pe) || h.ids.empty()) return;   // a hint is advice: ignore a bad one
+            std::lock_guard<std::mutex> lk(hint_mu);
+            if (!conv_slot.ready() || hints.size() >= 64) return;
+            hints.push_back(std::move(h));
+            hint_cv.notify_one();
+        };
+        // the standby slot ready for one hinted request (under slot_mu)
+        auto prepare_slot = [&](const Hint& h) {
+            std::string pe;
+            const bool cvec = strata::kernels::cvec().loaded() ? h.cvec : true;
+            // the next turn of the running conversation stays where it is: the active session continues it
+            size_t c = 0;
+            while (c < anchor.size() && c < h.ids.size() && anchor[c] == h.ids[c]) ++c;
+            if (!anchor.empty() && c == anchor.size()) return;
+            const int64_t s_tokens = standby.occupied ? strata::core::conversation_best_ids(standby.meta, h.ids, cvec).tokens : 0;
+            auto r = conversations.best_ids(h.ids, cvec);
+            if (s_tokens > 0 && s_tokens >= r.tokens) return;   // already in the slot
+            if (r.tokens == 0 && !conversations.enabled()) return;   // emptying the slot would lose its conversation
+            if (standby.occupied) {
+                standby_writeback(pe);
+                r = conversations.best_ids(h.ids, cvec);         // the write-back may have evicted or re-indexed
+            }
+            if (r.tokens > 0) standby_load(r.index, pe);           // else: a new chat, the slot is empty for its copy
+        };
+        // THE SLOT WORKER.  Wakes for a hint, and every 30 s to expire parked conversations past their TTL.
+        std::thread slot_worker;
+        if (conv_slot.ready())
+            slot_worker = std::thread([&] {
+                strata::core::conversation_slot_unpin_thread();   // off the host loop's core: it decodes meanwhile
+                std::unique_lock<std::mutex> hl(hint_mu);
+                for (;;) {
+                    hint_cv.wait_for(hl, std::chrono::seconds(30), [&] {
+                        return slot_quit || std::any_of(hints.begin(), hints.end(), [](const Hint& x) { return !x.seen; });
+                    });
+                    if (slot_quit) return;
+                    std::optional<Hint> h;
+                    for (Hint& x : hints)
+                        if (!x.seen) { x.seen = true; h = x; break; }
+                    hl.unlock();
+                    {
+                        std::lock_guard<std::mutex> sl(slot_mu);
+                        if (const size_t gone = conversations.expire(strata::core::conversation_clock_s()))
+                            std::fprintf(stderr, "strata serve: conversation cache: %zu expired after %lld s unused; "
+                                                 "parked=%zu bytes=%zu\n", gone, (long long) o.conversation_cache_ttl_s,
+                                         conversations.size(), conversations.bytes());
+                        bool live_hint = false;
+                        if (h) {
+                            std::lock_guard<std::mutex> lk(hint_mu);
+                            live_hint = std::any_of(hints.begin(), hints.end(),
+                                                    [&](const Hint& x) { return x.tag == h->tag; });
+                        }
+                        if (live_hint) prepare_slot(*h);
+                    }
+                    hl.lock();
+                }
+            });
+        struct JoinSlotWorker {
+            std::thread& t;
+            std::mutex& mu;
+            std::condition_variable& cv;
+            bool& quit;
+            ~JoinSlotWorker() {
+                { std::lock_guard<std::mutex> lk(mu); quit = true; }
+                cv.notify_all();
+                if (t.joinable()) t.join();
+            }
+        } join_slot_worker{slot_worker, hint_mu, hint_cv, slot_quit};
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -8891,6 +9116,8 @@ int main(int argc, char** argv) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
+                // advice about the queue, read while a request runs: it never waits behind one
+                if (l.rfind("HINT ", 0) == 0 || l.rfind("UNHINT ", 0) == 0) { on_hint(l); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
                 in_lines.push_back(l);
                 in_cv.notify_one();
@@ -8977,6 +9204,7 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                        "conversation_cache_ttl_s=%lld conversation_vram_slots=%d "
                         "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -8989,6 +9217,7 @@ int main(int argc, char** argv) {
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                        (long long) o.conversation_cache_ttl_s, conv_slot.ready() ? 2 : 1,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
@@ -9048,7 +9277,8 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        // "stop": this engine honours STOP; "hint": it takes HINT/UNHINT lines about queued requests
+        std::printf("READY %lld stop hint\n", (long long) o.max_context);
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -9958,6 +10188,7 @@ int main(int argc, char** argv) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
+                    std::unique_lock<std::mutex> restore_lock(slot_mu);   // the slot worker uses `conversations`
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
@@ -9979,9 +10210,11 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    anchor.clear();   // the restored conversation's next turn is not the replaced one's
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
-                        const size_t n_parked = conversations.clear();
+                        size_t n_parked = conversations.clear();
+                        if (standby.occupied) { standby = {}; ++n_parked; }
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
@@ -10221,6 +10454,9 @@ int main(int argc, char** argv) {
                 }
             }
             nf_hit = false;
+            // The slot worker's load or write-back finishes first, and `conversations`/`standby` are this thread's
+            // until the request's source is settled (slot_lock.unlock below).
+            std::unique_lock<std::mutex> slot_lock(slot_mu);
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
             // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
@@ -10230,7 +10466,8 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 tail_ckpt_len = -1;
-                const size_t n_parked = conversations.clear();
+                size_t n_parked = conversations.clear();
+                if (standby.occupied) { standby = {}; ++n_parked; }   // the standby VRAM slot is one more of them
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
@@ -10280,10 +10517,33 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // The slot worker's load or write-back has finished (slot_lock, above) - it is what this request would
+            // otherwise do in front of the user - and `conversations`/`standby` are this thread's until the source is
+            // settled.
+            if (const size_t gone = conversations.expire(strata::core::conversation_clock_s()))
+                std::fprintf(stderr, "strata serve: conversation cache: %zu expired after %lld s unused; parked=%zu "
+                                     "bytes=%zu\n", gone, (long long) o.conversation_cache_ttl_s, conversations.size(),
+                             conversations.bytes());
+            const int64_t have = std::max(resume, slot_tokens);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // THE STANDBY SLOT, when it holds the longest source: a swap.  A parked source goes through the slot too
+            // (load, then swap), so the outgoing conversation stays on the GPU either way - the two most recent
+            // conversations are the two slots, the rest wait in RAM.
+            strata::core::ConversationMatch standby_m;
+            if (standby.occupied) standby_m = strata::core::conversation_best(standby.meta, ids, req_imgs, want_cvec);
+            bool via_slot = standby_m.tokens > have && standby_m.tokens >= parked.tokens;
+            if (!via_slot && conv_slot.ready() && parked.tokens > have) {
+                standby_writeback(err);
+                parked = conversations.best(ids, req_imgs, want_cvec);   // the write-back may have evicted or moved it
+                if (parked.tokens > have && standby_load(parked.index, err)) {
+                    standby_m = strata::core::conversation_best(standby.meta, ids, req_imgs, want_cvec);
+                    via_slot = standby_m.tokens > have;
+                }
+                parked = {};
+            }
             std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
-            if (incoming) slot_source = -1;
+            if (!conv_slot.ready() && parked.tokens > have) incoming.emplace(conversations.take(parked.index));
+            if (incoming || via_slot) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -10307,8 +10567,6 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
-            // Preserve the outgoing branch before any checkpoint rewind, reset,
-            // or incoming restore overwrites the positional state it requires.
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
             // (a sibling query of the last one).  What the last query added past it is its private suffix - a few
             // dozen tokens, cheaper to read than the prefix's whole K/V is to copy to the host - so it is not parked:
@@ -10318,7 +10576,81 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            if (via_slot) {
+                // SWAP: the standby conversation becomes the session's, the outgoing one takes its place in the slot.
+                // Both directions move at once; the extent is the longer conversation's.
+                const int64_t out_n = live_ok ? (int64_t) live.size() : 0;
+                const int64_t in_n = (int64_t) standby.meta.live.ids.size();
+                strata::core::ConversationSlotStats moved;
+                const strata::core::QsaState* draft = use_mtp ? &mtp.kv_state() : nullptr;
+                if (cudaDeviceSynchronize() != cudaSuccess ||
+                    !strata::core::conversation_slot_move(strata::core::ConversationSlotMove::swap, ss, draft, conv_slot,
+                                                          g, std::max(out_n, in_n), slot_stream, err, &moved,
+                                                          slot_threads) ||
+                    !strata::core::conversation_slot_refresh(ss, draft, g, in_n, slot_stream, err)) {
+                    // a half-done exchange leaves neither conversation whole: never decode from it
+                    std::printf("ERR switching conversation slots: %s\n", err.c_str());
+                    return 1;
+                }
+                strata::core::SavedConversation out;
+                out.live.ids = std::move(live);
+                out.live.imgs = std::move(live_imgs);
+                out.checkpoints = std::move(checks);
+                out.cvec = cvec_cached;
+                auto out_reuse = conversations.take_reuse();
+                const bool out_ok = live_ok && !out.live.ids.empty();
+                live = std::move(standby.meta.live.ids);
+                live_imgs = std::move(standby.meta.live.imgs);
+                checks = std::move(standby.meta.checkpoints);
+                cvec_cached = standby.meta.cvec;
+                conversations.retain(std::move(standby.reuse));
+                standby = {};
+                if (out_ok) {   // a request that stopped halfway left nothing whole to keep
+                    standby.occupied = true;
+                    standby.meta = std::move(out);
+                    standby.reuse = std::move(out_reuse);
+                }
+                resume = standby_m.tokens;
+                from_live = standby_m.live;
+                std::fprintf(stderr, "strata serve: conversation slot: swapped in %lld tokens (%s), out %lld, in %.1f ms "
+                                     "(%.0f MiB VRAM + %.0f MiB pinned RAM each way; pinned %.1f ms, VRAM tail %.1f ms)\n",
+                             (long long) resume, from_live ? "live" : "checkpoint", (long long) out_n, moved.ms,
+                             (double) moved.device_bytes / 1048576.0, (double) moved.host_bytes / 1048576.0,
+                             moved.cpu_ms, moved.gpu_wait_ms);
+            } else if (conv_slot.ready()) {
+                // COPY: this request rewinds or replaces the session's conversation (a new chat through its system-
+                // prompt checkpoint, an earlier message edited), so the slot keeps the whole of it first.  Whatever
+                // the slot held goes to RAM (the hint for this request usually did that already, while the last one
+                // decoded).  NOT for the next turn of the same chat: it resumes at the previous prompt's last turn
+                // (the chat template drops the reply's thinking from the history), and keeping the branch it leaves -
+                // the previous reply as it was rendered - would push the OTHER conversation out of the slot on every
+                // turn of this one.
+                const bool next_turn = !anchor.empty() && resume >= (int64_t) anchor.size();
+                if (!from_live && live_ok && !live.empty() && !next_turn && !pin_sibling) {
+                    if (standby.occupied) standby_writeback(err);
+                    strata::core::ConversationSlotStats moved;
+                    if (cudaDeviceSynchronize() != cudaSuccess ||
+                        !strata::core::conversation_slot_move(strata::core::ConversationSlotMove::copy, ss,
+                                                              use_mtp ? &mtp.kv_state() : nullptr, conv_slot, g,
+                                                              (int64_t) live.size(), slot_stream, err, &moved,
+                                                              slot_threads)) {
+                        std::printf("ERR copying the conversation into the standby slot: %s\n", err.c_str());
+                        return 1;
+                    }
+                    standby.occupied = true;
+                    standby.meta = {};
+                    standby.meta.live.ids = live;
+                    standby.meta.live.imgs = live_imgs;
+                    standby.meta.checkpoints = checks;
+                    standby.meta.cvec = cvec_cached;
+                    standby.reuse = conversations.take_reuse();   // its K/V bytes are the slot's now, unchanged
+                    std::fprintf(stderr, "strata serve: conversation slot: kept %zu tokens in the standby slot in %.1f ms\n",
+                                 live.size(), moved.ms);
+                }
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling &&
+                       !park_current(incoming ? incoming->bytes() : 0)) {
+                // Preserve the outgoing branch before any checkpoint rewind, reset,
+                // or incoming restore overwrites the positional state it requires.
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -10497,6 +10829,14 @@ int main(int argc, char** argv) {
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
+            {   // what this chat's next turn repeats: the prompt up to its last turn (the hints compare against it)
+                int64_t a = n - 1;
+                if (o.turn_token >= 0)
+                    for (int64_t i = n - 1; i > 0; --i)
+                        if (ids[(size_t) i] == o.turn_token) { a = i; break; }
+                anchor.assign(ids.begin(), ids.begin() + a);
+            }
+            slot_lock.unlock();   // the worker may ready the slot for the next request while this one runs
             pp_total = n;
             pp_from = read_from;
             pp_reached = read_from;

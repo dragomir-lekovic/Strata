@@ -1,0 +1,6 @@
+{"tag": "A", "conv": "A", "wall_s": 40.29, "cache_n": 0, "prompt_n": 120269, "prompt_ms": 39999.3, "decode_tok_s": 37.9, "text": "jasper"}
+{"tag": "B", "conv": "B", "wall_s": 41.16, "cache_n": 0, "prompt_n": 120601, "prompt_ms": 40859.0, "decode_tok_s": 32.0, "text": "topaz"}
+{"tag": "A", "conv": "A", "wall_s": 1.61, "cache_n": 120273, "prompt_n": 29, "prompt_ms": 1300.7, "decode_tok_s": 46.7, "text": "jasper prairie"}
+{"tag": "B", "conv": "B", "wall_s": 1.04, "cache_n": 120594, "prompt_n": 40, "prompt_ms": 745.7, "decode_tok_s": 45.7, "text": "topaz cloud"}
+{"tag": "A", "conv": "A", "wall_s": 0.97, "cache_n": 120308, "prompt_n": 29, "prompt_ms": 668.6, "decode_tok_s": 63.2, "text": "jasper prairie hotel"}
+{"tag": "B", "conv": "B", "wall_s": 0.97, "cache_n": 120639, "prompt_n": 29, "prompt_ms": 667.0, "decode_tok_s": 50.8, "text": "topaz cloud harbor"}

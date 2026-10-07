@@ -4085,6 +4085,19 @@ def engine_version(exe: Path) -> tuple:
     return tuple(int(x) for x in v.split(".")[:4] if x.isdigit())
 
 
+CONVERSATION_FLAGS = ("--conversation-cache-mib", "--conversation-cache-slots", "--conversation-cache-ttl-s",
+                      "--conversation-vram-slots")
+
+
+def engine_knows(exe: Path, flag: str) -> bool:
+    """Whether the engine binary takes `flag` (its usage text names every option it parses).  For options newer
+    than the version gates: an engine kept after a failed update (issue #49) must not be handed one it refuses."""
+    try:
+        return flag.encode() in Path(exe).read_bytes()
+    except OSError:
+        return False
+
+
 def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
@@ -4214,6 +4227,12 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
         del a[i:i + 2]
         changed = True
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
+    for flag in CONVERSATION_FLAGS:
+        if flag in a[:-1] and not engine_knows(cfg["exe"], flag):
+            i = a.index(flag)
+            del a[i:i + 2]
+            changed = True
+            warn(f"the installed engine has no {flag}: started without it until the engine is updated")
     if changed:
         write_config(cfg_path, cfg)
     return cfg
@@ -5644,6 +5663,22 @@ def main() -> int:
                 warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
                      "cache: it stays on auto, which may take the room the OS needs (#1715). A smaller "
                      "--resident-budget-gib leaves room")
+    # Several people (or agents) on one engine: each conversation they leave is parked in RAM for 30 minutes, and
+    # with KV streaming the GPU holds two of them - the one decoding and a standby slot the next queued one streams
+    # into meanwhile (~0.3 GB of VRAM, a second pinned KV copy in RAM) - so a switch is a swap, not a re-read of the
+    # whole prompt (docs/DETAILS.md, "Multiple conversations").  The RAM cache takes what is left beside the model,
+    # both KV copies and 6 GB for the system, up to 32 GB (~13 conversations at 128K); under 4 GB it stays off.
+    streamed = "--kv-resident" in args
+    spare_gb = ram - MODELS[model]["ram_gb"] - kv_ram_gb * (2 if streamed else 1) - 6
+    if not multi and not low_ram and budget is None and spare_gb >= 4 and engine_knows(eng / EXE, "--conversation-cache-ttl-s"):
+        cache_gb = int(min(32, spare_gb))
+        args += ["--conversation-cache-mib", str(cache_gb * 1024), "--conversation-cache-slots", "64",
+                 "--conversation-cache-ttl-s", "1800"]
+        streamed = streamed and engine_knows(eng / EXE, "--conversation-vram-slots")
+        if streamed:
+            args += ["--conversation-vram-slots", "2"]
+        ok(f"conversations: up to {cache_gb} GB of RAM keeps each one for 30 minutes"
+           f"{'; the GPU holds two at once' if streamed else ''}")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
         if vision == "gpu" and a.vram_reserve_mib is None and 0 < gpu.get("vram_gb", 0.0) <= 12.5:

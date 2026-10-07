@@ -948,7 +948,7 @@ window and ignored, and a malformed field is a 400. One pinned prefix at a time 
 it needs `--prompt-cache 3` or more. `tools/research_run.py` runs a document and a question list against a server with and
 without it. The engine's own key is `pin=N` on the `GEN` line.
 
-**Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
+**Multiple conversations.** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
 their requests alternate; it does not execute requests concurrently. No client session
@@ -958,7 +958,53 @@ With `--layer-split`, a parked conversation holds one image per stage (each late
 session and its share of the conversation checkpoints), every image is validated before
 anything is overwritten, and each is restored on its own GPU. Verified on a 4-GPU split:
 a 9,276-token conversation restored in 51 ms, and its follow-up decodes exactly the tokens
-it decodes when the conversation never left (`tools/parking_test.py`). FP16,
+it decodes when the conversation never left (`tools/parking_test.py`).
+
+Setup (an engine built from this tree) turns it on when the RAM allows: up to 32 GB, 64
+conversations, 30 minutes each, and with KV streaming the standby slot below - on one GPU,
+without a low-RAM mode or a RAM budget.
+
+A parked conversation leaves after `--conversation-cache-ttl-s N` seconds without use
+(default 1800; 0 = only the budget and the slot cap evict). The clock restarts every
+time the conversation is used and parked again. A conversation that holds a pinned shared
+prefix (`pin=`) stays, as it does under eviction.
+
+*Two conversations on the GPU* (`--conversation-vram-slots 2`). The session holds one
+conversation at fixed addresses; a second slot beside it holds another: its GDN rows,
+PLE history and indexers in VRAM (305 MiB at 128K, taken from the expert cache before
+it sizes itself) and, with KV streaming, its K/V in pinned RAM (1.68 GiB at 128K int8;
+without streaming the K/V would be in VRAM, so setup only enables the slot with it). A
+switch between the two exchanges their bytes in place - the VRAM part on the GPU, the
+pinned part on CPU threads - and never re-captures a graph:
+
+| Two chats of ~120K tokens each, int8 KV, RTX 5070 Ti | the other chat's next turn, until its first token |
+|---|---|
+| no cache | 40 s: its whole prompt again |
+| RAM cache only | 0.67-1.3 s: park the outgoing one (0.3-0.94 s) + restore (0.12 s) |
+| standby slot | 0.30-0.39 s: a swap (55-67 ms) |
+
+(bench/results/2026-10-07-conversation-slots; the rest of each figure is reading the new message, as in any turn.)
+
+The two most recent conversations are the two slots; the rest wait in RAM. A parked one
+that is asked for goes through the slot (load, then swap), so the outgoing one stays on
+the GPU. While a request decodes, the server tells the engine about the next queued one
+(`HINT`, below) and the engine's slot worker prepares the slot for it: writes the slot's
+conversation back to RAM and loads the queued one, or empties the slot for a new chat.
+When that request gets its turn the switch is a swap. The next turn of the same chat
+(which resumes at its last turn boundary, because the chat template drops the reply's
+thinking) never displaces the other conversation. A swap is checked bit for bit:
+a conversation that went A, B, A, B, C, A ends in the same GDN, PLE, indexer, K/V and
+draft state as A, A, A alone (`STRATA_STATE_HASH=1`). The slot needs one GPU (no
+`--layer-split`), the prompt cache, and neither `--batch` (each batch slot has its own
+session) nor `--kv-grow` (the elastic K/V maps only the cells it has grown to); with any
+of them the engine says so and runs with one slot.
+
+Protocol: `HINT <tag> [cvec=0|1] <id,id,...>` names a queued request, `UNHINT <tag>`
+withdraws it; READY advertises `hint`. Hints carry token ids only (pictures are encoded
+when the request is admitted), so a prefetch ignores image identity; the request itself
+still needs exact pictures to reuse anything.
+
+FP16,
 INT8, Q4_0 and identity-layout K8V4 snapshots are supported; the K8V4 draft ring
 remains INT8, as in upstream. Windows/HIP and multi-GPU runtime coverage must be
 reported separately from Linux/CUDA evidence.
@@ -1213,7 +1259,8 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
 `memory` before any copy, the file it would have replaced untouched. The times are single runs.
 
-**Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+**Current limits (v1):** one request at a time (a queued one waits, while its conversation is made ready) unless
+`"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up

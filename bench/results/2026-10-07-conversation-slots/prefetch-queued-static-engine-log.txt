@@ -1,0 +1,34 @@
+strata generate: 1466 MiB of weights loaded from /home/dragomir/Strata-data/packs/iq3_s (302 canonical tensors skipped: served natively)
+strata mtp: draft layer loaded, 835 MiB of VRAM (experts 675, dense 111), files read in 0.19 s (4174 MiB/s)
+strata generate: loaded 46.84 GiB at 5.77 GiB/s
+314 MiB of VRAM free with everything loaded
+prompt 120269 tokens = 0 reused + 120269 read in 39868 ms (3016.7 tok/s), 3 generated in 78 ms (38.3 tok/s), drafts accepted 3 of 3, 6 checkpoints
+conversation slot: kept 120273 tokens in the standby slot in 44.6 ms
+prompt 120601 tokens = 0 reused + 120601 read in 40121 ms (3006.0 tok/s), 3 generated in 94 ms (32.0 tok/s), drafts accepted 3 of 6, 6 checkpoints
+conversation cache: wrote back the standby slot: 120273 tokens in 962.9 ms; parked=1 bytes=2664811812 evictions=0 snapshot_bytes=2664811812 reused_kv_bytes=0
+conversation slot: kept 120606 tokens in the standby slot in 43.2 ms
+prompt 120308 tokens = 0 reused + 120308 read in 41132 ms (2924.9 tok/s), 2 generated in 59 ms (34.0 tok/s), drafts accepted 3 of 3, 6 checkpoints
+conversation cache: wrote back the standby slot: 120606 tokens in 981.3 ms; parked=2 bytes=5334693932 evictions=0 snapshot_bytes=2669882120 reused_kv_bytes=0
+conversation slot: loaded 120273 tokens into the standby slot in 97.4 ms; parked=1 bytes=2669882120
+conversation slot: swapped in 120273 tokens (live), out 120312, in 64.6 ms (289 MiB VRAM + 1575 MiB pinned RAM each way; pinned 64.5 ms, VRAM tail 0.0 ms)
+conversation cache: wrote back the standby slot: 120312 tokens in 940.3 ms; parked=2 bytes=7171148972 evictions=0 snapshot_bytes=2665367772 reused_kv_bytes=0
+conversation slot: loaded 120606 tokens into the standby slot in 133.6 ms; parked=1 bytes=4501266852
+prompt 120307 tokens = 120273 reused + 34 read in 1479 ms (23.0 tok/s), 200 generated in 3072 ms (65.1 tok/s), drafts accepted 72 of 105, 6 checkpoints
+conversation slot: swapped in 120594 tokens (checkpoint), out 120506, in 56.1 ms (289 MiB VRAM + 1579 MiB pinned RAM each way; pinned 55.9 ms, VRAM tail 0.0 ms)
+prompt 120639 tokens = 120594 reused + 45 read in 391 ms (115.1 tok/s), 200 generated in 2812 ms (71.1 tok/s), drafts accepted 89 of 113, 6 checkpoints
+conversation cache: wrote back the standby slot: 120506 tokens in 268.3 ms; parked=2 bytes=7908971676 evictions=0 snapshot_bytes=3402637176 reused_kv_bytes=1835831808
+conversation slot: loaded 120312 tokens into the standby slot in 95.4 ms; parked=1 bytes=5243603904
+conversation slot: swapped in 120301 tokens (checkpoint), out 120839, in 57.0 ms (290 MiB VRAM + 1582 MiB pinned RAM each way; pinned 56.8 ms, VRAM tail 0.0 ms)
+conversation cache: wrote back the standby slot: 120839 tokens in 409.2 ms; parked=2 bytes=8647076940 evictions=0 snapshot_bytes=3407985036 reused_kv_bytes=1840716288
+conversation slot: loaded 120506 tokens into the standby slot in 148.2 ms; parked=1 bytes=5244439764
+prompt 120345 tokens = 120301 reused + 44 read in 829 ms (53.1 tok/s), 200 generated in 2803 ms (71.4 tok/s), drafts accepted 84 of 105, 6 checkpoints
+conversation slot: swapped in 120506 tokens (live), out 120545, in 56.2 ms (289 MiB VRAM + 1578 MiB pinned RAM each way; pinned 56.1 ms, VRAM tail 0.0 ms)
+prompt 120543 tokens = 120506 reused + 37 read in 334 ms (110.8 tok/s), 200 generated in 2753 ms (72.6 tok/s), drafts accepted 93 of 115, 6 checkpoints
+conversation cache: wrote back the standby slot: 120545 tokens in 301.1 ms; parked=2 bytes=9384712732 evictions=0 snapshot_bytes=3403223240 reused_kv_bytes=1836259200
+conversation slot: loaded 120839 tokens into the standby slot in 97.4 ms; parked=1 bytes=5976727696
+conversation slot: swapped in 120839 tokens (live), out 120743, in 55.9 ms (290 MiB VRAM + 1582 MiB pinned RAM each way; pinned 55.8 ms, VRAM tail 0.0 ms)
+conversation cache: wrote back the standby slot: 120743 tokens in 416.5 ms; parked=2 bytes=9384864156 evictions=0 snapshot_bytes=3402792588 reused_kv_bytes=1839373056
+conversation slot: loaded 120545 tokens into the standby slot in 148.8 ms; parked=1 bytes=5981640916
+prompt 120875 tokens = 120839 reused + 36 read in 814 ms (44.2 tok/s), 200 generated in 1773 ms (112.8 tok/s), drafts accepted 164 of 169, 6 checkpoints
+conversation slot: swapped in 120545 tokens (live), out 121075, in 57.3 ms (290 MiB VRAM + 1585 MiB pinned RAM each way; pinned 57.2 ms, VRAM tail 0.0 ms)
+prompt 120581 tokens = 120545 reused + 36 read in 326 ms (110.4 tok/s), 200 generated in 2110 ms (94.8 tok/s), drafts accepted 134 of 152, 6 checkpoints
